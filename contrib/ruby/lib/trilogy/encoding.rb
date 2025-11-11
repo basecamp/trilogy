@@ -8,7 +8,8 @@ class Trilogy
       "cp850"    => "CP850",
       "hp8"      => nil,
       "koi8r"    => "KOI8-R",
-      "latin1"   => "ISO-8859-1",
+      # When it says latin1 on the tin, but it isn't, that's amore
+      "latin1"   => "UTF-8",
       "latin2"   => "ISO-8859-2",
       "swe7"     => nil,
       "ascii"    => "US-ASCII",

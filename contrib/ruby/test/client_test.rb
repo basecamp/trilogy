@@ -1108,6 +1108,20 @@ class ClientTest < TrilogyTest
     assert_equal expected, client.query("SELECT 'こんにちは'").to_a.first.first
   end
 
+  def test_latin1_results_are_utf8
+    client = new_tcp_client(encoding: "latin1")
+
+    assert_equal "latin1", client.query("SELECT @@character_set_client").first.first
+    assert_equal "latin1", client.query("SELECT @@character_set_results").first.first
+    assert_equal "latin1", client.query("SELECT @@character_set_connection").first.first
+    collation = client.query("SELECT @@collation_connection").first.first
+    assert_includes ["latin1_swedish_ci", "latin1_general_ci"], collation
+
+    result = client.query("SELECT CAST(0xC3A9 AS CHAR CHARACTER SET latin1)").first.first
+    assert_equal Encoding::UTF_8, result.encoding
+    assert_equal "\u00E9", result
+  end
+
   def test_character_encoding_handles_binary_queries
     client = new_tcp_client
     expected = "\xff".b

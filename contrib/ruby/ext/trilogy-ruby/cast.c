@@ -34,7 +34,8 @@ static const char *ruby_encoding_name_map[] = {
     [TRILOGY_ENCODING_KEYBCS2] = NULL,
     [TRILOGY_ENCODING_KOI8R] = "KOI8-R",
     [TRILOGY_ENCODING_KOI8U] = "KOI8-U",
-    [TRILOGY_ENCODING_LATIN1] = "ISO-8859-1",
+    // When life gives you latin1 containing UTF-8 bytes...
+    [TRILOGY_ENCODING_LATIN1] = "UTF-8",
     [TRILOGY_ENCODING_LATIN2] = "ISO-8859-2",
     [TRILOGY_ENCODING_LATIN5] = "ISO-8859-9",
     [TRILOGY_ENCODING_LATIN7] = "ISO-8859-13",
