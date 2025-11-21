@@ -1,0 +1,31 @@
+# Benchmark configuration
+warmup: 2              # seconds to warmup before measuring
+time: 10               # seconds to run each benchmark
+iterations: 5          # number of benchmark runs for statistical analysis
+
+# Data sizes for testing
+data_sizes:
+  small: 100
+  medium: 1000
+  large: 10000
+  xlarge: 100000
+
+# Concurrency levels
+concurrency:
+  threads: [1, 2, 4, 8, 16]
+  fibers: [1, 10, 100, 1000]
+  pool_sizes: [5, 10, 20, 50]
+
+# Memory profiling
+memory:
+  gc_disabled: true    # disable GC during critical measurements
+  track_allocations: true
+  detailed_reports: false  # set to true for verbose memory reports
+
+# Query configurations
+queries:
+  simple_select: "SELECT * FROM benchmark_data WHERE id = ?"
+  bulk_select: "SELECT * FROM benchmark_data LIMIT ?"
+  insert: "INSERT INTO benchmark_data (data, created_at) VALUES (?, NOW())"
+  update: "UPDATE benchmark_data SET data = ? WHERE id = ?"
+  delete: "DELETE FROM benchmark_data WHERE id = ?"

@@ -1,0 +1,14 @@
+default: &default
+  host: 127.0.0.1
+  port: 3306
+  username: root
+  password:
+  database: trilogy_benchmark
+  encoding: utf8mb4
+
+development:
+  <<: *default
+
+test:
+  <<: *default
+  database: trilogy_benchmark_test

@@ -6,3 +6,5 @@ group :benchmark do
   gem "mysql2"
   gem "benchmark-ips"
 end
+
+gem "ostruct", "~> 0.6.3"

@@ -11,6 +11,7 @@ GEM
     bigdecimal (3.1.8)
     minitest (5.25.4)
     mysql2 (0.5.6)
+    ostruct (0.6.3)
     rake (13.0.1)
     rake-compiler (1.0.7)
       rake
@@ -22,6 +23,7 @@ DEPENDENCIES
   benchmark-ips
   minitest (~> 5.5)
   mysql2
+  ostruct (~> 0.6.3)
   rake-compiler (~> 1.0)
   trilogy!
 

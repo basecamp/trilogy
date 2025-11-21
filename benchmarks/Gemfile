@@ -1,0 +1,25 @@
+source "https://rubygems.org"
+
+# MySQL drivers to benchmark
+gem "trilogy", path: "../", glob: "contrib/ruby/trilogy.gemspec"
+gem "mysql2"
+
+# Paper over stdlib extractions / missing deps
+gem "benchmark"
+gem "bigdecimal"
+
+# Benchmarking and profiling tools
+gem "benchmark-ips"
+gem "benchmark-memory"
+gem "memory_profiler"
+gem "stackprof"
+
+# Concurrency testing
+gem "async"
+gem "async-io"
+gem "concurrent-ruby"
+
+# Utilities
+gem "terminal-table"
+gem "rainbow"
+gem "yaml"
