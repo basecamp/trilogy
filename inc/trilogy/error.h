@@ -26,7 +26,8 @@
     XX(TRILOGY_UNKNOWN_TYPE, -21)                                                                                      \
     XX(TRILOGY_TIMEOUT, -22)                                                                                           \
     XX(TRILOGY_AUTH_PLUGIN_ERROR, -23)                                                                                 \
-    XX(TRILOGY_MEM_ERROR, -24)
+    XX(TRILOGY_MEM_ERROR, -24)                                                                                         \
+    XX(TRILOGY_STATE_VIOLATION, -25)
 
 enum {
 #define XX(name, code) name = code,

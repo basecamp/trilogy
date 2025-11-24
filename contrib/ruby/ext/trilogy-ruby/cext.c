@@ -119,7 +119,8 @@ static inline buffer_pool *get_buffer_pool(void)
 static void buffer_checkout(trilogy_buffer_t *buffer, size_t initial_capacity)
 {
     buffer_pool * pool = get_buffer_pool();
-    if (pool->len) {
+
+    if (pool && pool->len) {
         pool->len--;
         buffer->buff = pool->entries[pool->len].buff;
         buffer->cap = pool->entries[pool->len].cap;
@@ -132,6 +133,13 @@ static void buffer_checkout(trilogy_buffer_t *buffer, size_t initial_capacity)
 static bool buffer_checkin(trilogy_buffer_t *buffer)
 {
     buffer_pool * pool = get_buffer_pool();
+
+    if (pool == NULL) {
+        xfree(buffer->buff);
+        buffer->buff = NULL;
+        buffer->cap = 0;
+        return false;
+    }
 
     if (pool->len >= BUFFER_POOL_MAX_SIZE) {
         xfree(buffer->buff);
@@ -160,7 +168,7 @@ static bool buffer_checkin(trilogy_buffer_t *buffer)
 
 VALUE Trilogy_CastError;
 static VALUE Trilogy_BaseConnectionError, Trilogy_ProtocolError, Trilogy_SSLError, Trilogy_QueryError,
-    Trilogy_ConnectionClosedError,
+    Trilogy_ConnectionClosedError, Trilogy_StateViolationError,
     Trilogy_TimeoutError, Trilogy_SyscallError, Trilogy_Result, Trilogy_EOFError, Trilogy_AuthPluginError;
 
 static ID id_socket, id_host, id_port, id_username, id_password, id_found_rows, id_connect_timeout, id_read_timeout,
@@ -317,6 +325,10 @@ static void handle_trilogy_error(struct trilogy_ctx *ctx, int rc, const char *ms
         rb_raise(Trilogy_EOFError, "%" PRIsVALUE ": TRILOGY_CLOSED_CONNECTION", rbmsg);
     }
 
+    case TRILOGY_STATE_VIOLATION: {
+        rb_raise(Trilogy_StateViolationError, "%" PRIsVALUE ": TRILOGY_STATE_VIOLATION: connection state corrupted, likely due to unsafe multi-threaded access", rbmsg);
+    }
+
     case TRILOGY_AUTH_PLUGIN_ERROR: {
         rb_raise(Trilogy_AuthPluginError, "%" PRIsVALUE ": TRILOGY_AUTH_PLUGIN_ERROR", rbmsg);
     }
@@ -348,6 +360,10 @@ static VALUE allocate_trilogy(VALUE klass)
 
 static int flush_writes(struct trilogy_ctx *ctx)
 {
+    if (ctx->conn.socket == NULL) {
+        rb_raise(Trilogy_StateViolationError, "TRILOGY_STATE_VIOLATION: connection state corrupted, likely due to unsafe multi-threaded access");
+    }
+
     while (1) {
         int rc = trilogy_flush_writes(&ctx->conn);
 
@@ -931,6 +947,10 @@ static VALUE read_query_response(VALUE vargs)
         if (rc != TRILOGY_OK) {
             handle_trilogy_error(ctx, rc, "trilogy_query_recv");
         }
+
+        if (ctx->conn.socket == NULL) {
+            rb_raise(Trilogy_StateViolationError, "TRILOGY_STATE_VIOLATION: connection state corrupted, likely due to unsafe multi-threaded access");
+        }
     }
 
     struct timespec finish;
@@ -1394,6 +1414,9 @@ RUBY_FUNC_EXPORTED void Init_cext(void)
 
     Trilogy_ConnectionClosedError = rb_const_get(Trilogy, rb_intern("ConnectionClosed"));
     rb_global_variable(&Trilogy_ConnectionClosedError);
+
+    Trilogy_StateViolationError = rb_const_get(Trilogy, rb_intern("StateViolationError"));
+    rb_global_variable(&Trilogy_StateViolationError);
 
     Trilogy_Result = rb_const_get(Trilogy, rb_intern("Result"));
     rb_global_variable(&Trilogy_Result);

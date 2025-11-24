@@ -111,6 +111,13 @@ class Trilogy
     include ConnectionError
   end
 
+  # Raised when connection state is detected to be invalid or corrupted,
+  # typically due to unsafe multi-threaded access. This is a fatal error
+  # that should not be retried: fix the code to avoid sharing connections
+  # between threads without synchronization.
+  class StateViolationError < BaseError
+  end
+
   # Occurs when a socket read or write returns EOF or when an operation is
   # attempted on a socket which previously encountered an error.
   class EOFError < BaseConnectionError
