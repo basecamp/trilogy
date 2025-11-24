@@ -120,4 +120,8 @@ class Trilogy
   # authentication plugin
   class AuthPluginError < Trilogy::BaseConnectionError
   end
+
+  # Raised when a connection is used concurrently by multiple fibers or threads
+  class SynchronizationError < BaseError
+  end
 end

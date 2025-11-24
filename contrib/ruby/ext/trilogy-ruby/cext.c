@@ -160,7 +160,7 @@ static bool buffer_checkin(trilogy_buffer_t *buffer)
 
 VALUE Trilogy_CastError;
 static VALUE Trilogy_BaseConnectionError, Trilogy_ProtocolError, Trilogy_SSLError, Trilogy_QueryError,
-    Trilogy_ConnectionClosedError,
+    Trilogy_ConnectionClosedError, Trilogy_SynchronizationError,
     Trilogy_TimeoutError, Trilogy_SyscallError, Trilogy_Result, Trilogy_EOFError, Trilogy_AuthPluginError;
 
 static ID id_socket, id_host, id_port, id_username, id_password, id_found_rows, id_connect_timeout, id_read_timeout,
@@ -175,26 +175,290 @@ struct trilogy_ctx {
     char server_version[TRILOGY_SERVER_VERSION_SIZE + 1];
     unsigned int query_flags;
     VALUE encoding;
+    VALUE owner_fiber;
 };
 
-static void rb_trilogy_acquire_buffer(struct trilogy_ctx *ctx)
+struct release_args {
+    struct trilogy_ctx *ctx;
+    VALUE self;
+};
+
+static void rb_trilogy_acquire_buffer(struct trilogy_ctx *ctx, VALUE self)
 {
+    VALUE current_fiber = rb_fiber_current();
+    if (!NIL_P(ctx->owner_fiber) && ctx->owner_fiber != current_fiber) {
+        rb_raise(Trilogy_SynchronizationError, "connection is in use by another fiber or thread");
+    }
+    RB_OBJ_WRITE(self, &ctx->owner_fiber, current_fiber);
+
     if (!ctx->conn.packet_buffer.buff) {
         buffer_checkout(&ctx->conn.packet_buffer, TRILOGY_DEFAULT_BUF_SIZE);
     }
 }
 
-static void rb_trilogy_release_buffer(struct trilogy_ctx *ctx)
+static void rb_trilogy_release_buffer(struct release_args *args)
 {
+    struct trilogy_ctx *ctx = args->ctx;
     if (ctx->conn.packet_buffer.buff) {
         buffer_checkin(&ctx->conn.packet_buffer);
     }
+    RB_OBJ_WRITE(args->self, &ctx->owner_fiber, Qnil);
+}
+
+static VALUE rb_trilogy_release_buffer_ensure(VALUE arg)
+{
+    rb_trilogy_release_buffer((struct release_args *)arg);
+    return Qnil;
+}
+
+// forward declarations for functions used inside lease bodies
+static int try_connect(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake, const trilogy_sockopt_t *opts);
+static void authenticate(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake, trilogy_ssl_mode_t ssl_mode);
+static int flush_writes(struct trilogy_ctx *ctx);
+static VALUE execute_read_query_response(struct trilogy_ctx *ctx);
+static void handle_trilogy_error(struct trilogy_ctx *ctx, int rc, const char *msg, ...);
+
+typedef VALUE (*trilogy_lease_fn)(struct trilogy_ctx *ctx, void *arg);
+
+struct connection_lease {
+    struct trilogy_ctx *ctx;
+    trilogy_lease_fn fn;
+    void *arg;
+    struct release_args release;
+};
+
+static VALUE connection_lease_body(VALUE vargs)
+{
+    struct connection_lease *lease = (struct connection_lease *)vargs;
+    return lease->fn(lease->ctx, lease->arg);
+}
+
+static VALUE with_connection_lease(struct trilogy_ctx *ctx, VALUE self, trilogy_lease_fn fn, void *arg)
+{
+    struct connection_lease lease = {
+        .ctx = ctx,
+        .fn = fn,
+        .arg = arg,
+        .release = {.ctx = ctx, .self = self},
+    };
+
+    rb_trilogy_acquire_buffer(ctx, self);
+
+    return rb_ensure(connection_lease_body, (VALUE)&lease, rb_trilogy_release_buffer_ensure, (VALUE)&lease.release);
+}
+
+/* Ownership semantics:
+ * - Each operation leases the connection for the duration of the call and releases afterward.
+ * - Concurrent access from another fiber during an operation raises SynchronizationError.
+ * - Methods like next_result take their own lease and may be called from any fiber.
+ * - Interleaving distinct queries across fibers between calls is not detected and will produce wrong results.
+ */
+#define LEASE(ctx, self, fn, arg) with_connection_lease((ctx), (self), (trilogy_lease_fn)(fn), (void *)(arg))
+#define LEASE0(ctx, self, fn) with_connection_lease((ctx), (self), (trilogy_lease_fn)(fn), NULL)
+
+struct connect_args {
+    trilogy_sockopt_t connopt;
+    trilogy_handshake_t handshake;
+};
+
+static VALUE perform_connect(struct trilogy_ctx *ctx, void *vargs)
+{
+    struct connect_args *a = (struct connect_args *)vargs;
+    int rc = try_connect(ctx, &a->handshake, &a->connopt);
+    if (rc != TRILOGY_OK) {
+        if (a->connopt.path) {
+            handle_trilogy_error(ctx, rc, "trilogy_connect - unable to connect to %s", a->connopt.path);
+        } else {
+            handle_trilogy_error(ctx, rc, "trilogy_connect - unable to connect to %s:%hu", a->connopt.hostname,
+                                 a->connopt.port);
+        }
+    }
+
+    memcpy(ctx->server_version, a->handshake.server_version, TRILOGY_SERVER_VERSION_SIZE);
+    ctx->server_version[TRILOGY_SERVER_VERSION_SIZE] = 0;
+
+    authenticate(ctx, &a->handshake, a->connopt.ssl_mode);
+
+    return Qnil;
+}
+
+static VALUE perform_change_db(struct trilogy_ctx *ctx, void *arg)
+{
+    VALUE database = (VALUE)arg;
+    int rc = trilogy_change_db_send(&ctx->conn, RSTRING_PTR(database), RSTRING_LEN(database));
+
+    if (rc == TRILOGY_AGAIN) {
+        rc = flush_writes(ctx);
+    }
+
+    if (rc != TRILOGY_OK) {
+        handle_trilogy_error(ctx, rc, "trilogy_change_db_send");
+    }
+
+    while (1) {
+        rc = trilogy_change_db_recv(&ctx->conn);
+
+        if (rc == TRILOGY_OK) {
+            break;
+        }
+
+        if (rc != TRILOGY_AGAIN) {
+            handle_trilogy_error(ctx, rc, "trilogy_change_db_recv");
+        }
+
+        rc = trilogy_sock_wait_read(ctx->conn.socket);
+        if (rc != TRILOGY_OK) {
+            handle_trilogy_error(ctx, rc, "trilogy_change_db_recv");
+        }
+    }
+
+    return Qtrue;
+}
+
+static VALUE perform_set_option(struct trilogy_ctx *ctx, void *arg)
+{
+    VALUE option = (VALUE)arg;
+    int rc = trilogy_set_option_send(&ctx->conn, NUM2INT(option));
+
+    if (rc == TRILOGY_AGAIN) {
+        rc = flush_writes(ctx);
+    }
+
+    if (rc != TRILOGY_OK) {
+        handle_trilogy_error(ctx, rc, "trilogy_set_option_send");
+    }
+
+    while (1) {
+        rc = trilogy_set_option_recv(&ctx->conn);
+
+        if (rc == TRILOGY_OK) {
+            break;
+        }
+
+        if (rc != TRILOGY_AGAIN) {
+            handle_trilogy_error(ctx, rc, "trilogy_set_option_recv");
+        }
+
+        rc = trilogy_sock_wait_read(ctx->conn.socket);
+        if (rc != TRILOGY_OK) {
+            handle_trilogy_error(ctx, rc, "trilogy_set_option_recv");
+        }
+    }
+
+    return Qtrue;
+}
+
+static VALUE perform_query(struct trilogy_ctx *ctx, void *arg)
+{
+    VALUE query = (VALUE)arg;
+    int rc = trilogy_query_send(&ctx->conn, RSTRING_PTR(query), RSTRING_LEN(query));
+
+    if (rc == TRILOGY_AGAIN) {
+        rc = flush_writes(ctx);
+    }
+
+    if (rc < 0) {
+        handle_trilogy_error(ctx, rc, "trilogy_query_send");
+    }
+
+    return execute_read_query_response(ctx);
+}
+
+static VALUE perform_ping(struct trilogy_ctx *ctx, void *arg)
+{
+    (void)arg;
+    int rc = trilogy_ping_send(&ctx->conn);
+
+    if (rc == TRILOGY_AGAIN) {
+        rc = flush_writes(ctx);
+    }
+
+    if (rc < 0) {
+        handle_trilogy_error(ctx, rc, "trilogy_ping_send");
+    }
+
+    while (1) {
+        rc = trilogy_ping_recv(&ctx->conn);
+
+        if (rc == TRILOGY_OK) {
+            break;
+        }
+
+        if (rc != TRILOGY_AGAIN) {
+            handle_trilogy_error(ctx, rc, "trilogy_ping_recv");
+        }
+
+        rc = trilogy_sock_wait_read(ctx->conn.socket);
+        if (rc != TRILOGY_OK) {
+            handle_trilogy_error(ctx, rc, "trilogy_ping_recv");
+        }
+    }
+
+    return Qtrue;
+}
+
+static VALUE perform_escape(struct trilogy_ctx *ctx, void *arg)
+{
+    VALUE str = (VALUE)arg;
+    rb_encoding *str_enc = rb_enc_get(str);
+
+    const char *escaped_str;
+    size_t escaped_len;
+
+    int rc = trilogy_escape(&ctx->conn, RSTRING_PTR(str), RSTRING_LEN(str), &escaped_str, &escaped_len);
+
+    if (rc < 0) {
+        handle_trilogy_error(ctx, rc, "trilogy_escape");
+    }
+
+    return rb_enc_str_new(escaped_str, escaped_len, str_enc);
+}
+
+static VALUE perform_close(struct trilogy_ctx *ctx, void *arg)
+{
+    (void)arg;
+    if (ctx->conn.socket == NULL) {
+        return Qnil;
+    }
+
+    int rc = trilogy_close_send(&ctx->conn);
+
+    if (rc == TRILOGY_AGAIN) {
+        rc = flush_writes(ctx);
+    }
+
+    if (rc == TRILOGY_OK) {
+        while (1) {
+            rc = trilogy_close_recv(&ctx->conn);
+
+            if (rc != TRILOGY_AGAIN) {
+                break;
+            }
+
+            if (trilogy_sock_wait_read(ctx->conn.socket) < 0) {
+                break;
+            }
+        }
+    }
+
+    ERR_clear_error();
+
+    trilogy_free(&ctx->conn);
+
+    return Qnil;
+}
+
+static VALUE perform_next_result(struct trilogy_ctx *ctx, void *arg)
+{
+    (void)arg;
+    return execute_read_query_response(ctx);
 }
 
 static void mark_trilogy(void *ptr)
 {
     struct trilogy_ctx *ctx = ptr;
     rb_gc_mark(ctx->encoding);
+    rb_gc_mark(ctx->owner_fiber);
 }
 
 static void free_trilogy(void *ptr)
@@ -274,8 +538,6 @@ static void handle_trilogy_error(struct trilogy_ctx *ctx, int rc, const char *ms
     VALUE rbmsg = rb_vsprintf(msg, args);
     va_end(args);
 
-    rb_trilogy_release_buffer(ctx);
-
     if (!trilogy_error_recoverable_p(rc)) {
         if (ctx->conn.socket != NULL) {
             // trilogy_sock_shutdown may affect errno
@@ -337,6 +599,7 @@ static VALUE allocate_trilogy(VALUE klass)
     VALUE obj = TypedData_Make_Struct(klass, struct trilogy_ctx, &trilogy_data_type, ctx);
 
     ctx->query_flags = TRILOGY_FLAGS_DEFAULT;
+    ctx->owner_fiber = Qnil;
 
     if (trilogy_init_no_buffer(&ctx->conn) < 0) {
         VALUE rbmsg = rb_str_new("trilogy_init", 13);
@@ -610,178 +873,158 @@ static void authenticate(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake
 static VALUE rb_trilogy_connect(VALUE self, VALUE encoding, VALUE charset, VALUE opts)
 {
     struct trilogy_ctx *ctx = get_ctx(self);
-    trilogy_sockopt_t connopt = {0};
-    trilogy_handshake_t handshake;
+    struct connect_args args = {.connopt = {0}};
     VALUE val;
 
     RB_OBJ_WRITE(self, &ctx->encoding, encoding);
-    connopt.encoding = NUM2INT(charset);
+    args.connopt.encoding = NUM2INT(charset);
 
     Check_Type(opts, T_HASH);
 
     if ((val = rb_hash_lookup(opts, ID2SYM(id_ssl_mode))) != Qnil) {
         Check_Type(val, T_FIXNUM);
-        connopt.ssl_mode = (trilogy_ssl_mode_t)NUM2INT(val);
+        args.connopt.ssl_mode = (trilogy_ssl_mode_t)NUM2INT(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_connect_timeout))) != Qnil) {
-        connopt.connect_timeout = double_to_timeval(NUM2DBL(val));
+        args.connopt.connect_timeout = double_to_timeval(NUM2DBL(val));
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_read_timeout))) != Qnil) {
-        connopt.read_timeout = double_to_timeval(NUM2DBL(val));
+        args.connopt.read_timeout = double_to_timeval(NUM2DBL(val));
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_write_timeout))) != Qnil) {
-        connopt.write_timeout = double_to_timeval(NUM2DBL(val));
+        args.connopt.write_timeout = double_to_timeval(NUM2DBL(val));
     }
 
     if (RTEST(rb_hash_aref(opts, ID2SYM(id_keepalive_enabled)))) {
-        connopt.keepalive_enabled = true;
+        args.connopt.keepalive_enabled = true;
     }
 
     if ((val = rb_hash_lookup(opts, ID2SYM(id_keepalive_idle))) != Qnil) {
         Check_Type(val, T_FIXNUM);
-        connopt.keepalive_idle = NUM2USHORT(val);
+        args.connopt.keepalive_idle = NUM2USHORT(val);
     }
 
     if ((val = rb_hash_lookup(opts, ID2SYM(id_keepalive_count))) != Qnil) {
         Check_Type(val, T_FIXNUM);
-        connopt.keepalive_count = NUM2USHORT(val);
+        args.connopt.keepalive_count = NUM2USHORT(val);
     }
 
     if ((val = rb_hash_lookup(opts, ID2SYM(id_keepalive_interval))) != Qnil) {
         Check_Type(val, T_FIXNUM);
-        connopt.keepalive_interval = NUM2USHORT(val);
+        args.connopt.keepalive_interval = NUM2USHORT(val);
     }
 
     if ((val = rb_hash_lookup(opts, ID2SYM(id_max_allowed_packet))) != Qnil) {
         Check_Type(val, T_FIXNUM);
-        connopt.max_allowed_packet = NUM2SIZET(val);
+        args.connopt.max_allowed_packet = NUM2SIZET(val);
     }
 
     if ((val = rb_hash_lookup(opts, ID2SYM(id_host))) != Qnil) {
         Check_Type(val, T_STRING);
 
-        connopt.hostname = StringValueCStr(val);
-        connopt.port = 3306;
+        args.connopt.hostname = StringValueCStr(val);
+        args.connopt.port = 3306;
 
         if ((val = rb_hash_lookup(opts, ID2SYM(id_port))) != Qnil) {
             Check_Type(val, T_FIXNUM);
-            connopt.port = NUM2USHORT(val);
+            args.connopt.port = NUM2USHORT(val);
         }
     } else {
-        connopt.path = (char *)"/tmp/mysql.sock";
+        args.connopt.path = (char *)"/tmp/mysql.sock";
 
         if ((val = rb_hash_lookup(opts, ID2SYM(id_socket))) != Qnil) {
             Check_Type(val, T_STRING);
-            connopt.path = StringValueCStr(val);
+            args.connopt.path = StringValueCStr(val);
         }
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_username))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.username = StringValueCStr(val);
+        args.connopt.username = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_password))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.password = RSTRING_PTR(val);
-        connopt.password_len = RSTRING_LEN(val);
+        args.connopt.password = RSTRING_PTR(val);
+        args.connopt.password_len = RSTRING_LEN(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_database))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.database = StringValueCStr(val);
-        connopt.flags |= TRILOGY_CAPABILITIES_CONNECT_WITH_DB;
+        args.connopt.database = StringValueCStr(val);
+        args.connopt.flags |= TRILOGY_CAPABILITIES_CONNECT_WITH_DB;
     }
 
     if (RTEST(rb_hash_aref(opts, ID2SYM(id_enable_cleartext_plugin)))) {
-        connopt.enable_cleartext_plugin = true;
+        args.connopt.enable_cleartext_plugin = true;
     }
 
     if (RTEST(rb_hash_aref(opts, ID2SYM(id_found_rows)))) {
-        connopt.flags |= TRILOGY_CAPABILITIES_FOUND_ROWS;
+        args.connopt.flags |= TRILOGY_CAPABILITIES_FOUND_ROWS;
     }
 
     if (rb_hash_aref(opts, ID2SYM(id_multi_result)) != Qfalse) {
-        connopt.flags |= TRILOGY_CAPABILITIES_MULTI_RESULTS;
+        args.connopt.flags |= TRILOGY_CAPABILITIES_MULTI_RESULTS;
     }
 
     if (RTEST(rb_hash_aref(opts, ID2SYM(id_multi_statement)))) {
-        connopt.flags |= TRILOGY_CAPABILITIES_MULTI_STATEMENTS;
+        args.connopt.flags |= TRILOGY_CAPABILITIES_MULTI_STATEMENTS;
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_ssl_ca))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.ssl_ca = StringValueCStr(val);
+        args.connopt.ssl_ca = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_ssl_capath))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.ssl_capath = StringValueCStr(val);
+        args.connopt.ssl_capath = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_ssl_cert))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.ssl_cert = StringValueCStr(val);
+        args.connopt.ssl_cert = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_ssl_cipher))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.ssl_cipher = StringValueCStr(val);
+        args.connopt.ssl_cipher = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_ssl_crl))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.ssl_crl = StringValueCStr(val);
+        args.connopt.ssl_crl = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_ssl_crlpath))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.ssl_crlpath = StringValueCStr(val);
+        args.connopt.ssl_crlpath = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_ssl_key))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.ssl_key = StringValueCStr(val);
+        args.connopt.ssl_key = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_tls_ciphersuites))) != Qnil) {
         Check_Type(val, T_STRING);
-        connopt.tls_ciphersuites = StringValueCStr(val);
+        args.connopt.tls_ciphersuites = StringValueCStr(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_tls_min_version))) != Qnil) {
         Check_Type(val, T_FIXNUM);
-        connopt.tls_min_version = NUM2INT(val);
+        args.connopt.tls_min_version = NUM2INT(val);
     }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_tls_max_version))) != Qnil) {
         Check_Type(val, T_FIXNUM);
-        connopt.tls_max_version = NUM2INT(val);
+        args.connopt.tls_max_version = NUM2INT(val);
     }
 
-    rb_trilogy_acquire_buffer(ctx);
-
-    int rc = try_connect(ctx, &handshake, &connopt);
-    if (rc != TRILOGY_OK) {
-        if (connopt.path) {
-            handle_trilogy_error(ctx, rc, "trilogy_connect - unable to connect to %s", connopt.path);
-        } else {
-            handle_trilogy_error(ctx, rc, "trilogy_connect - unable to connect to %s:%hu", connopt.hostname,
-                                 connopt.port);
-        }
-    }
-
-    memcpy(ctx->server_version, handshake.server_version, TRILOGY_SERVER_VERSION_SIZE);
-    ctx->server_version[TRILOGY_SERVER_VERSION_SIZE] = 0;
-
-    authenticate(ctx, &handshake, connopt.ssl_mode);
-
-    rb_trilogy_release_buffer(ctx);
-
-    return Qnil;
+    return LEASE(ctx, self, perform_connect, &args);
 }
 
 static VALUE rb_trilogy_change_db(VALUE self, VALUE database)
@@ -790,78 +1033,15 @@ static VALUE rb_trilogy_change_db(VALUE self, VALUE database)
 
     StringValue(database);
 
-    rb_trilogy_acquire_buffer(ctx);
-
-    int rc = trilogy_change_db_send(&ctx->conn, RSTRING_PTR(database), RSTRING_LEN(database));
-
-    if (rc == TRILOGY_AGAIN) {
-        rc = flush_writes(ctx);
-    }
-
-    if (rc != TRILOGY_OK) {
-        handle_trilogy_error(ctx, rc, "trilogy_change_db_send");
-    }
-
-    while (1) {
-        rc = trilogy_change_db_recv(&ctx->conn);
-
-        if (rc == TRILOGY_OK) {
-            break;
-        }
-
-        if (rc != TRILOGY_AGAIN) {
-            handle_trilogy_error(ctx, rc, "trilogy_change_db_recv");
-        }
-
-        rc = trilogy_sock_wait_read(ctx->conn.socket);
-        if (rc != TRILOGY_OK) {
-            handle_trilogy_error(ctx, rc, "trilogy_change_db_recv");
-        }
-    }
-
-    rb_trilogy_release_buffer(ctx);
-
-    return Qtrue;
+    return LEASE(ctx, self, perform_change_db, database);
 }
 
 static VALUE rb_trilogy_set_server_option(VALUE self, VALUE option)
 {
     struct trilogy_ctx *ctx = get_open_ctx(self);
 
-    rb_trilogy_acquire_buffer(ctx);
-
-    int rc = trilogy_set_option_send(&ctx->conn, NUM2INT(option));
-
-    if (rc == TRILOGY_AGAIN) {
-        rc = flush_writes(ctx);
-    }
-
-    if (rc != TRILOGY_OK) {
-        handle_trilogy_error(ctx, rc, "trilogy_set_option_send");
-    }
-
-    while (1) {
-        rc = trilogy_set_option_recv(&ctx->conn);
-
-        if (rc == TRILOGY_OK) {
-            break;
-        }
-
-        if (rc != TRILOGY_AGAIN) {
-            handle_trilogy_error(ctx, rc, "trilogy_set_option_recv");
-        }
-
-        rc = trilogy_sock_wait_read(ctx->conn.socket);
-        if (rc != TRILOGY_OK) {
-            handle_trilogy_error(ctx, rc, "trilogy_set_option_recv");
-        }
-    }
-
-    rb_trilogy_release_buffer(ctx);
-
-    return Qtrue;
+    return LEASE(ctx, self, perform_set_option, option);
 }
-
 
 static void load_query_options(unsigned int query_flags, struct rb_trilogy_cast_options *cast_options)
 {
@@ -1042,7 +1222,7 @@ static VALUE execute_read_query_response(struct trilogy_ctx *ctx)
     struct rb_trilogy_cast_options cast_options;
     load_query_options(ctx->query_flags, &cast_options);
 
-    struct read_query_response_state args = {
+    struct read_query_response_state response_state = {
         .cast_options = &cast_options,
         .ctx = ctx,
         .rc = TRILOGY_OK,
@@ -1050,7 +1230,7 @@ static VALUE execute_read_query_response(struct trilogy_ctx *ctx)
     };
 
     int state = 0;
-    VALUE result = rb_protect(read_query_response, (VALUE)&args, &state);
+    VALUE result = rb_protect(read_query_response, (VALUE)&response_state, &state);
 
     // If we have seen an unexpected exception, jump to it so it gets raised.
     if (state) {
@@ -1061,11 +1241,7 @@ static VALUE execute_read_query_response(struct trilogy_ctx *ctx)
     // Handle errors we can gracefully recover from here that were due to
     // errors signaled at the protocol level, not unexpected exceptions.
     if (result == Qundef) {
-        handle_trilogy_error(ctx, args.rc, args.msg);
-    }
-
-    if (!(ctx->conn.server_status & TRILOGY_SERVER_STATUS_MORE_RESULTS_EXISTS)) {
-        rb_trilogy_release_buffer(ctx);
+        handle_trilogy_error(ctx, response_state.rc, response_state.msg);
     }
 
     return result;
@@ -1079,7 +1255,7 @@ static VALUE rb_trilogy_next_result(VALUE self)
         return Qnil;
     }
 
-    return execute_read_query_response(ctx);
+    return LEASE0(ctx, self, perform_next_result);
 }
 
 static VALUE rb_trilogy_more_results_exist(VALUE self)
@@ -1100,56 +1276,14 @@ static VALUE rb_trilogy_query(VALUE self, VALUE query)
     StringValue(query);
     query = rb_str_export_to_enc(query, rb_to_encoding(ctx->encoding));
 
-    rb_trilogy_acquire_buffer(ctx);
-
-    int rc = trilogy_query_send(&ctx->conn, RSTRING_PTR(query), RSTRING_LEN(query));
-
-    if (rc == TRILOGY_AGAIN) {
-        rc = flush_writes(ctx);
-    }
-
-    if (rc < 0) {
-        handle_trilogy_error(ctx, rc, "trilogy_query_send");
-    }
-
-    return execute_read_query_response(ctx);
+    return LEASE(ctx, self, perform_query, query);
 }
 
 static VALUE rb_trilogy_ping(VALUE self)
 {
     struct trilogy_ctx *ctx = get_open_ctx(self);
 
-    rb_trilogy_acquire_buffer(ctx);
-
-    int rc = trilogy_ping_send(&ctx->conn);
-
-    if (rc == TRILOGY_AGAIN) {
-        rc = flush_writes(ctx);
-    }
-
-    if (rc < 0) {
-        handle_trilogy_error(ctx, rc, "trilogy_ping_send");
-    }
-
-    while (1) {
-        rc = trilogy_ping_recv(&ctx->conn);
-
-        if (rc == TRILOGY_OK) {
-            break;
-        }
-
-        if (rc != TRILOGY_AGAIN) {
-            handle_trilogy_error(ctx, rc, "trilogy_ping_recv");
-        }
-
-        rc = trilogy_sock_wait_read(ctx->conn.socket);
-        if (rc != TRILOGY_OK) {
-            handle_trilogy_error(ctx, rc, "trilogy_ping_recv");
-        }
-    }
-
-    rb_trilogy_release_buffer(ctx);
-    return Qtrue;
+    return LEASE0(ctx, self, perform_ping);
 }
 
 static VALUE rb_trilogy_escape(VALUE self, VALUE str)
@@ -1163,64 +1297,14 @@ static VALUE rb_trilogy_escape(VALUE self, VALUE str)
         rb_raise(rb_eEncCompatError, "input string must be ASCII-compatible");
     }
 
-    const char *escaped_str;
-    size_t escaped_len;
-
-    rb_trilogy_acquire_buffer(ctx);
-
-    int rc = trilogy_escape(&ctx->conn, RSTRING_PTR(str), RSTRING_LEN(str), &escaped_str, &escaped_len);
-
-    if (rc < 0) {
-        handle_trilogy_error(ctx, rc, "trilogy_escape");
-    }
-
-    VALUE escaped_string = rb_enc_str_new(escaped_str, escaped_len, str_enc);
-
-    rb_trilogy_release_buffer(ctx);
-
-    return escaped_string;
+    return LEASE(ctx, self, perform_escape, str);
 }
 
 static VALUE rb_trilogy_close(VALUE self)
 {
     struct trilogy_ctx *ctx = get_ctx(self);
 
-    if (ctx->conn.socket == NULL) {
-        return Qnil;
-    }
-
-    rb_trilogy_acquire_buffer(ctx);
-
-    int rc = trilogy_close_send(&ctx->conn);
-
-    if (rc == TRILOGY_AGAIN) {
-        rc = flush_writes(ctx);
-    }
-
-    if (rc == TRILOGY_OK) {
-        while (1) {
-            rc = trilogy_close_recv(&ctx->conn);
-
-            if (rc != TRILOGY_AGAIN) {
-                break;
-            }
-
-            if (trilogy_sock_wait_read(ctx->conn.socket) < 0) {
-                // timed out
-                break;
-            }
-        }
-    }
-
-    // We aren't checking or raising errors here (we need close to always close the socket and free the connection), so
-    // we must clear any SSL errors left in the queue from a read/write.
-    ERR_clear_error();
-
-    rb_trilogy_release_buffer(ctx);
-
-    trilogy_free(&ctx->conn);
-
-    return Qnil;
+    return LEASE0(ctx, self, perform_close);
 }
 
 static VALUE rb_trilogy_closed(VALUE self)
@@ -1394,6 +1478,9 @@ RUBY_FUNC_EXPORTED void Init_cext(void)
 
     Trilogy_ConnectionClosedError = rb_const_get(Trilogy, rb_intern("ConnectionClosed"));
     rb_global_variable(&Trilogy_ConnectionClosedError);
+
+    Trilogy_SynchronizationError = rb_const_get(Trilogy, rb_intern("SynchronizationError"));
+    rb_global_variable(&Trilogy_SynchronizationError);
 
     Trilogy_Result = rb_const_get(Trilogy, rb_intern("Result"));
     rb_global_variable(&Trilogy_Result);
